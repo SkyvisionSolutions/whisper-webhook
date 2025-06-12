@@ -1,134 +1,147 @@
-# app.py - Serveur Flask pour Whisper avec timestamps (optimisé pour Railway)
 from flask import Flask, request, jsonify
 import requests
-import base64
 import tempfile
 import os
-from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
-# Configuration depuis les variables d'environnement
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')  # Variable Railway
+# Configuration
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is required")
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB limite OpenAI
 
-@app.route('/whisper', methods=['POST'])
-def transcribe_audio():
+# Route d'accueil (pour éviter l'erreur "Not Found")
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "message": "Service de timestamps audio actif",
+        "service": "whisper-webhook",
+        "endpoints": {
+            "process": "POST /process-audio",
+            "health": "GET /health"
+        }
+    })
+
+# Route principale pour n8n
+@app.route('/process-audio', methods=['POST'])
+def process_audio():
     try:
-        # Récupérer les données de n8n
-        data = request.get_json()
+        print("🎵 Traitement audio démarré...")
         
-        if not data or 'audioData' not in data:
-            return jsonify({"error": "No audio data provided"}), 400
-            
-        # Décoder les données base64
-        audio_data = base64.b64decode(data['audioData'])
-        file_name = data.get('fileName', 'audio.mp3')
+        # Vérifier qu'un fichier a été envoyé
+        if 'audio' not in request.files:
+            return jsonify({'success': False, 'error': 'Aucun fichier audio fourni'}), 400
         
-        # Vérifier la taille du fichier
-        if len(audio_data) > MAX_FILE_SIZE:
-            return jsonify({"error": "File too large (max 25MB)"}), 400
+        audio_file = request.files['audio']
+        segment_duration = float(request.form.get('segment_duration', 4))
         
-        # Créer un fichier temporaire
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as temp_file:
-            temp_file.write(audio_data)
-            temp_file_path = temp_file.name
+        print(f"📁 Fichier reçu: {audio_file.filename}")
+        print(f"⏱️ Durée de segment: {segment_duration}s")
+        
+        # Sauvegarder temporairement
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
+            audio_file.save(temp_file.name)
+            temp_path = temp_file.name
         
         try:
-            # Préparer la requête pour OpenAI Whisper
-            with open(temp_file_path, 'rb') as audio_file:
-                files = {
-                    'file': (file_name, audio_file, 'audio/mpeg')
-                }
-                
-                data_params = {
-                    'model': 'whisper-1',
-                    'response_format': 'verbose_json',
-                    'timestamp_granularities[]': 'word',
-                    'language': 'en'
-                }
-                
-                headers = {
-                    'Authorization': f'Bearer {OPENAI_API_KEY}'
-                }
-                
-                # Appeler l'API Whisper
-                response = requests.post(
-                    'https://api.openai.com/v1/audio/transcriptions',
-                    files=files,
-                    data=data_params,
-                    headers=headers,
-                    timeout=300  # 5 minutes timeout
-                )
+            # Appeler Whisper
+            print("🤖 Appel à Whisper...")
+            transcription = call_whisper(temp_path)
             
-            # Nettoyer le fichier temporaire
-            os.unlink(temp_file_path)
+            # Créer les segments
+            print("✂️ Création des segments...")
+            segments = create_segments(transcription, segment_duration)
             
-            if response.status_code != 200:
-                return jsonify({
-                    "error": "OpenAI API error",
-                    "details": response.text,
-                    "status": response.status_code
-                }), response.status_code
+            print(f"✅ Traitement terminé: {len(segments)} segments créés")
             
-            # Traiter la réponse
-            transcription_data = response.json()
-            
-            # Extraire les segments avec timestamps
-            segments = []
-            if 'segments' in transcription_data:
-                for segment in transcription_data['segments']:
-                    segments.append({
-                        'id': segment['id'],
-                        'start': segment['start'],
-                        'end': segment['end'],
-                        'text': segment['text'].strip(),
-                        'duration': segment['end'] - segment['start']
-                    })
-            
-            # Extraire les mots avec timestamps (si disponibles)
-            words = []
-            if 'words' in transcription_data:
-                for word in transcription_data['words']:
-                    words.append({
-                        'word': word['word'],
-                        'start': word['start'],
-                        'end': word['end']
-                    })
-            
-            # Retourner les données formatées
             return jsonify({
-                "success": True,
-                "full_text": transcription_data.get('text', ''),
-                "language": transcription_data.get('language', ''),
-                "duration": transcription_data.get('duration', 0),
-                "segments": segments,
-                "words": words,
-                "segments_count": len(segments),
-                "words_count": len(words)
+                'success': True,
+                'total_duration': transcription.get('duration', 0),
+                'segments': segments
             })
             
-        except Exception as e:
-            # Nettoyer en cas d'erreur
-            if os.path.exists(temp_file_path):
-                os.unlink(temp_file_path)
-            raise e
-            
+        finally:
+            # Nettoyer le fichier temporaire
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+                
     except Exception as e:
-        return jsonify({
-            "error": "Internal server error",
-            "details": str(e)
-        }), 500
+        print(f"❌ Erreur: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
+def call_whisper(audio_path):
+    """Appeler l'API Whisper"""
+    with open(audio_path, 'rb') as audio_file:
+        files = {'file': audio_file}
+        data = {
+            'model': 'whisper-1',
+            'response_format': 'verbose_json',
+            'timestamp_granularities[]': 'word'
+        }
+        headers = {
+            'Authorization': f'Bearer {OPENAI_API_KEY}'
+        }
+        
+        response = requests.post(
+            'https://api.openai.com/v1/audio/transcriptions',
+            files=files,
+            data=data,
+            headers=headers,
+            timeout=300
+        )
+        
+        if response.status_code != 200:
+            raise Exception(f'Erreur Whisper ({response.status_code}): {response.text}')
+            
+        return response.json()
+
+def create_segments(transcription, segment_duration):
+    """Créer des segments de durée fixe"""
+    segments = []
+    total_duration = transcription.get('duration', 0)
+    total_segments = int(total_duration / segment_duration) + 1
+    
+    print(f"📊 Durée totale: {total_duration}s, {total_segments} segments")
+    
+    for i in range(total_segments):
+        start_time = i * segment_duration
+        end_time = min((i + 1) * segment_duration, total_duration)
+        
+        # Trouver les mots dans ce segment
+        words_in_segment = []
+        if 'words' in transcription:
+            words_in_segment = [
+                word for word in transcription['words']
+                if word['start'] >= start_time and word['start'] < end_time
+            ]
+        
+        segments.append({
+            'segment_id': i,
+            'start_time': round(start_time, 2),
+            'end_time': round(end_time, 2),
+            'duration': round(end_time - start_time, 2),
+            'has_lyrics': len(words_in_segment) > 0,
+            'lyrics': ' '.join([w['word'] for w in words_in_segment]).strip(),
+            'words': words_in_segment
+        })
+    
+    return segments
+
+# Route de santé
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy", "service": "whisper-webhook"})
+    return jsonify({
+        "status": "healthy", 
+        "service": "whisper-webhook",
+        "openai_configured": bool(OPENAI_API_KEY)
+    })
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))  # Railway fournit PORT automatiquement
-    print("🎙️  Whisper Webhook Server démarré!")
+    port = int(os.getenv('PORT', 5000))
+    print("🎙️ Whisper Webhook Server démarré!")
     print(f"📡 Port: {port}")
-    print("🔍 Health check: /health")
+    print("🔍 Endpoints:")
+    print("  GET  / - Page d'accueil")
+    print("  POST /process-audio - Traitement audio")
+    print("  GET  /health - Status")
     app.run(host='0.0.0.0', port=port, debug=False)
